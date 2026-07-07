@@ -9,8 +9,9 @@ import tempfile
 import unittest
 
 import torch
+import torchvision.transforms as T
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from train_photography_eye import LetterboxCompositionDataset
 
@@ -40,12 +41,14 @@ def _make_labelme_json(left, top, right, bottom):
 class TestLetterboxCompositionDataset(unittest.TestCase):
     """Tests for LetterboxCompositionDataset."""
 
-    def _make_dataset(self, images_with_boxes, target_size=TARGET):
+    def _make_dataset(self, images_with_boxes, target_size=TARGET, transform=None):
         """
         Write image+JSON pairs into a temp dir and return (dataset, tmpdir).
 
         images_with_boxes: list of (img: PIL.Image, box_xyxy: [x1,y1,x2,y2] in raw-pixel coords)
         """
+        if transform is None:
+            transform = T.ToTensor()
         tmpdir = tempfile.TemporaryDirectory()
         for idx, (img, box) in enumerate(images_with_boxes):
             name = f"{idx}.jpg"
@@ -53,7 +56,7 @@ class TestLetterboxCompositionDataset(unittest.TestCase):
             with open(os.path.join(tmpdir.name, f"{idx}.json"), "w") as f:
                 json.dump(_make_labelme_json(*box), f)
 
-        ds = LetterboxCompositionDataset(tmpdir.name, target_size=target_size)
+        ds = LetterboxCompositionDataset(tmpdir.name, target_size=target_size, transform=transform)
         return ds, tmpdir
 
     # ==============================================================
@@ -220,13 +223,15 @@ class TestLetterboxCompositionDataset(unittest.TestCase):
         tmpdir.cleanup()
 
     def test_box_full_image(self):
-        """Full-image box [0,0,w,h] → should become [0,0,1,1]."""
+        """Full-image box [0,0,w,h] → maps to letterboxed canvas coords."""
+        # 400×300 landscape → scale=0.56, 224×168 content, pad_y=28
+        # Box [0,0,400,300] → [0, 28/224=0.125, 1, 196/224=0.875]
         img = _make_image(400, 300, 3)
         ds, tmpdir = self._make_dataset([(img, [0, 0, 400, 300])])
         _, box_t = ds[0]
-        expected = [0.0, 0.0, 1.0, 1.0]
+        expected = [0.0, 28/224, 1.0, 196/224]
         for got, exp in zip(box_t.tolist(), expected):
-            self.assertAlmostEqual(got, exp, delta=0.01, msg=f"Full-box coords off")
+            self.assertAlmostEqual(got, exp, delta=0.01, msg=f"Full-box coords off: {box_t.tolist()}")
         tmpdir.cleanup()
 
     def test_box_tiny_image(self):
@@ -303,6 +308,72 @@ class TestLetterboxCompositionDataset(unittest.TestCase):
             img_t, _ = ds[i]
             self.assertEqual(img_t.shape, (3, TARGET, TARGET),
                              f"Mixed batch sample {i}: wrong shape")
+        tmpdir.cleanup()
+
+
+    # ==============================================================
+    # 5. 可视化导出 — 肉眼验证 letterbox + box 是否正确
+    # ==============================================================
+
+    def test_visual_export_letterboxed(self):
+        """随机生成一张图，letterbox 后导出为 PNG 供肉眼检查."""
+
+        # 画一张有内容的非随机图：白底 + 红框标注 GT 区域
+        # 这样肉眼能清楚看到 original box → letterbox box 映射
+        w, h = 400, 300  # landscape，会有上下黑边
+        canvas = Image.new("RGB", (w, h), "white")
+        drawer = ImageDraw.Draw(canvas)
+
+        # 画一些辅助线（网格）
+        for x in range(0, w, 50):
+            drawer.line([(x, 0), (x, h)], fill="lightgray", width=1)
+        for y in range(0, h, 50):
+            drawer.line([(0, y), (w, y)], fill="lightgray", width=1)
+
+        # 画一个红色矩形 — 这是标注框 (ground truth)
+        box_px = [80, 50, 320, 250]  # x1,y1,x2,y2
+        drawer.rectangle(box_px, outline="red", width=4)
+        drawer.text((box_px[0] + 5, box_px[1] + 5), "GT BOX", fill="red")
+
+        # 也写一个"原图尺寸"的标记
+        drawer.text((10, 10), f"Original {w}x{h}", fill="black")
+
+        # 构建 dataset
+        ds, tmpdir = self._make_dataset([(canvas, box_px)])
+        img_t, box_t = ds[0]
+
+        # ======== 导出 letterbox 后的图片 ========
+        # img_t 是 (3,224,224) float32 [0,1] → 转回 PIL
+        img_np = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        result_img = Image.fromarray(img_np, "RGB")
+
+        # 在导出图上叠加 predicted box (从归一化坐标转回像素)
+        x1n, y1n, x2n, y2n = box_t.tolist()
+        T = 224
+        px_box = [int(x1n * T), int(y1n * T), int(x2n * T), int(y2n * T)]
+
+        d2 = ImageDraw.Draw(result_img)
+        d2.rectangle(px_box, outline="lime", width=3)
+        d2.text((px_box[0] + 4, px_box[1] + 4), f"Box [{x1n:.2f},{y1n:.2f},{x2n:.2f},{y2n:.2f}]",
+                fill="lime")
+        d2.text((4, 4), f"Letterboxed {T}x{T}", fill="white")
+
+        # 保存
+        out_dir = os.path.dirname(os.path.abspath(__file__))
+        out_path = os.path.join(out_dir, "test_letterbox_visual.png")
+        result_img.save(out_path)
+        print(f"\n  ✅ 可视化结果已保存: {out_path}")
+        print(f"  📦 原图: {w}x{h}  →  Letterbox: {T}x{T}")
+        print(f"  🔴 原始 GT 框 (像素): {box_px}")
+        print(f"  🟢 归一化框 (letterbox后): [{x1n:.4f}, {y1n:.4f}, {x2n:.4f}, {y2n:.4f}]")
+        print(f"  🟢 对应像素: {px_box}")
+
+        # 基本断言：框必须在合理范围内
+        self.assertGreater(x2n, x1n, "Box width should be positive")
+        self.assertGreater(y2n, y1n, "Box height should be positive")
+        self.assertGreaterEqual(x1n, 0.0)
+        self.assertLessEqual(y2n, 1.0)
+
         tmpdir.cleanup()
 
 
