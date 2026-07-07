@@ -23,10 +23,11 @@ else:
     DEVICE = torch.device("cpu")
     print("⚠️ 未检测到 MPS，将使用 CPU 运行。")
 
-# ================= 2. LabelMe 数据集类 =================
-class LabelMeCompositionDataset(Dataset):
-    def __init__(self, img_dir, transform=None):
+# ================= 2. 升级版：Letterbox 数据集类 =================
+class LetterboxCompositionDataset(Dataset):
+    def __init__(self, img_dir, target_size=224, transform=None):
         self.img_dir = img_dir
+        self.target_size = target_size
         self.transform = transform
         self.samples = []
         
@@ -38,7 +39,7 @@ class LabelMeCompositionDataset(Dataset):
                     self.samples.append((fname, json_path))
         
         if len(self.samples) == 0:
-            raise ValueError(f"⚠️ 在 {img_dir} 中未找到任何 图片+JSON 配对！请检查 LabelMe 是否保存成功。")
+            raise ValueError(f"⚠️ 在 {img_dir} 中未找到任何 图片+JSON 配对！")
         print(f"📊 成功加载 {len(self.samples)} 组标注数据。")
 
     def __len__(self):
@@ -58,16 +59,12 @@ class LabelMeCompositionDataset(Dataset):
         
         box = None
         for shape in data['shapes']:
-            # 【核心升级】兼容普通矩形和旋转矩形
             if shape['shape_type'] in ['rectangle', 'oriented_rectangle']:
                 points = shape['points']
-                
-                # 如果是普通矩形(2个点)，转换为边界
                 if len(points) == 2:
                     (x1, y1), (x2, y2) = points
                     x_min, x_max = min(x1, x2), max(x1, x2)
                     y_min, y_max = min(y1, y2), max(y1, y2)
-                # 如果是旋转矩形或多边形(4个点)，求最小外接正矩形
                 elif len(points) >= 4:
                     x_coords = [p[0] for p in points]
                     y_coords = [p[1] for p in points]
@@ -77,22 +74,45 @@ class LabelMeCompositionDataset(Dataset):
                     continue
                     
                 # 归一化到 [0, 1]
-                x1_norm = x_min / orig_w
-                x2_norm = x_max / orig_w
-                y1_norm = y_min / orig_h
-                y2_norm = y_max / orig_h
-                
-                box = [x1_norm, y1_norm, x2_norm, y2_norm]
+                box = [x_min / orig_w, y_min / orig_h, x_max / orig_w, y_max / orig_h]
                 break
         
-        # 如果 JSON 里没找到框，返回全图作为默认值，防止报错
         if box is None:
             box = [0.0, 0.0, 1.0, 1.0] 
 
+        # 3. 【核心升级】Letterbox 等比缩放 + 居中填充
+        # 计算缩放比例，取较小值以确保图片能完全放进 224x224 中
+        scale = self.target_size / max(orig_w, orig_h)
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        
+        # 等比缩放图片
+        resized_img = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # 创建一张纯黑色的 224x224 画布，并把缩放后的图片贴在正中间
+        padded_img = Image.new("RGB", (self.target_size, self.target_size), (0, 0, 0))
+        pad_x = (self.target_size - new_w) // 2
+        pad_y = (self.target_size - new_h) // 2
+        padded_img.paste(resized_img, (pad_x, pad_y))
+        
+        # 4. 【关键】修正坐标：因为加了黑边，框的相对位置变了！
+        # 把原来 [0,1] 的坐标，映射到加了黑边后的 224x224 画布上，再归一化
+        x1_new = (box[0] * new_w + pad_x) / self.target_size
+        y1_new = (box[1] * new_h + pad_y) / self.target_size
+        x2_new = (box[2] * new_w + pad_x) / self.target_size
+        y2_new = (box[3] * new_h + pad_y) / self.target_size
+        
+        # 裁剪坐标，防止超出 [0, 1] 范围
+        final_box = [
+            max(0.0, min(1.0, x1_new)),
+            max(0.0, min(1.0, y1_new)),
+            max(0.0, min(1.0, x2_new)),
+            max(0.0, min(1.0, y2_new))
+        ]
+
         if self.transform:
-            image = self.transform(image)
+            padded_img = self.transform(padded_img)
             
-        return image, torch.tensor(box, dtype=torch.float32)
+        return padded_img, torch.tensor(final_box, dtype=torch.float32)
 
 # ================= 3. 构建轻量级回归模型 =================
 def get_model():
@@ -116,7 +136,7 @@ def train_model():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    dataset = LabelMeCompositionDataset(DATASET_DIR, transform=transform)
+    dataset = LetterboxCompositionDataset(DATASET_DIR, transform=transform)
     # num_workers=0 避免 Mac 上的多进程内存问题
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     
