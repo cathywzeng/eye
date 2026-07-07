@@ -12,7 +12,7 @@ from tqdm import tqdm
 # ================= 1. 核心配置 =================
 DATASET_DIR = "my_dataset"      # 你的图片和 LabelMe JSON 所在的同一个文件夹
 BATCH_SIZE = 16                 # M1 16G 内存建议 16
-EPOCHS = 50                     # 双头模型可能需要多跑几个 Epoch
+EPOCHS = 100                     # 双头模型可能需要多跑几个 Epoch
 LEARNING_RATE = 1e-4
 IMG_SIZE = 224                  # MobileNet 标准输入尺寸
 HEATMAP_SIZE = 56               # 热力图尺寸 (224 / 4 = 56)
@@ -141,7 +141,7 @@ class DualHeadMobileNet(nn.Module):
         # 分支 B：热力图回归头 (保留空间结构)
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(576, 1, kernel_size=1),
-            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False),  # 【新增】将 7x7 放大 8 倍变成 56x56
+            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False),
             nn.Sigmoid()
         )
 
@@ -151,7 +151,7 @@ class DualHeadMobileNet(nn.Module):
         heatmap_out = self.heatmap_head(features)
         return reg_out, heatmap_out
 
-# ================= 5. 训练循环 =================
+# ================= 5. 训练循环 (含一致性约束) =================
 def train_model():
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -179,11 +179,36 @@ def train_model():
             
             optimizer.zero_grad()
             pred_reg, pred_heatmap = model(images)
-            pred_reg = torch.sigmoid(pred_reg)
             
+            # 【注意】回归头不加 Sigmoid，配合 SmoothL1Loss 效果更好
+            # 预测框中心
+            pred_box_center_x = (pred_reg[:, 0] + pred_reg[:, 2]) / 2.0
+            pred_box_center_y = (pred_reg[:, 1] + pred_reg[:, 3]) / 2.0
+            
+            # 1. 回归头 Loss
             loss_reg = criterion_reg(pred_reg, boxes)
+            
+            # 2. 热力图头 Loss
             loss_heatmap = criterion_heatmap(pred_heatmap, heatmaps)
-            total_loss = loss_reg + 1.0 * loss_heatmap
+            
+            # 3. 【核心新增】一致性约束 Loss (强迫热力图中心和框的中心对齐！)
+            b, c, h, w = pred_heatmap.shape
+            y_indices = torch.arange(h, device=DEVICE, dtype=torch.float32) / h
+            x_indices = torch.arange(w, device=DEVICE, dtype=torch.float32) / w
+            
+            # 计算热力图的加权平均坐标 (Center of Mass)
+            sum_heatmap = pred_heatmap.sum(dim=[2, 3]) + 1e-6  # 防止除以0
+            center_x = (pred_heatmap.sum(dim=2) * x_indices).sum(dim=2) / sum_heatmap
+            center_y = (pred_heatmap.sum(dim=3) * y_indices).sum(dim=2) / sum_heatmap
+            
+            # 让热力图中心逼近预测框的中心
+            loss_consistency = nn.MSELoss()(
+                torch.stack([center_x, center_y], dim=1), 
+                torch.stack([pred_box_center_x, pred_box_center_y], dim=1)
+            )
+            
+            # 4. 总 Loss = 框的损失 + 热力图的损失 + 对齐的损失
+            total_loss = loss_reg + 1.0 * loss_heatmap + 0.5 * loss_consistency
             
             total_loss.backward()
             optimizer.step()
