@@ -141,6 +141,7 @@ class DualHeadMobileNet(nn.Module):
         # 分支 B：热力图回归头 (保留空间结构)
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(576, 1, kernel_size=1),
+            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False),  # 【新增】将 7x7 放大 8 倍变成 56x56
             nn.Sigmoid()
         )
 
