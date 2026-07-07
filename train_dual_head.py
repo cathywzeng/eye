@@ -201,9 +201,9 @@ def train_model():
             center_x = (pred_heatmap.sum(dim=2) * x_indices).sum(dim=2) / sum_heatmap
             center_y = (pred_heatmap.sum(dim=3) * y_indices).sum(dim=2) / sum_heatmap
             
-            # 让热力图中心逼近预测框的中心
+            # 让热力图中心逼近预测框的中心 (squeeze channel dim from center_x/center_y)
             loss_consistency = nn.MSELoss()(
-                torch.stack([center_x, center_y], dim=1), 
+                torch.stack([center_x.squeeze(1), center_y.squeeze(1)], dim=1),
                 torch.stack([pred_box_center_x, pred_box_center_y], dim=1)
             )
             
