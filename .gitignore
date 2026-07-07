@@ -1,6 +1,8 @@
 # Dataset
 my_dataset/
 my_dataset
+my_testset/
+my_testset
 
 # Python
 __pycache__/
