@@ -2,9 +2,8 @@ import argparse
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 import numpy as np
-import os
 import subprocess
 
 # ================= 1. 核心配置 =================
@@ -37,7 +36,7 @@ class DualHeadMobileNet(nn.Module):
         features = self.features(x)
         return self.reg_head(features), self.heatmap_head(features)
 
-# ================= 3. 极速预测并画图 =================
+# ================= 3. 极速预测并画图 (纯 Pillow 版) =================
 def predict_and_draw(image_path):
     # 1. 加载模型
     model = DualHeadMobileNet().to(DEVICE)
@@ -62,7 +61,7 @@ def predict_and_draw(image_path):
     ])
     input_tensor = transform(padded_img).unsqueeze(0).to(DEVICE)
     
-    # 3. 双头预测 (MPS 加速，仅需几毫秒)
+    # 3. 双头预测
     with torch.no_grad():
         pred_reg, pred_heatmap = model(input_tensor)
         pred_reg = torch.sigmoid(pred_reg).cpu().numpy()[0]
@@ -78,26 +77,41 @@ def predict_and_draw(image_path):
     line_width = max(3, int(min(orig_w, orig_h) / 200))
     draw.rectangle([x1, y1, x2, y2], outline="red", width=line_width)
     
-    # 5. 将 56x56 热力图放大到原图尺寸，并上色叠加
+    # 5. 生成纯粹的黑白热力图（最清晰，强推！）
     heatmap_img = Image.fromarray((pred_heatmap * 255).astype(np.uint8))
     heatmap_img = heatmap_img.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+    pure_heatmap_name = f"pure_heatmap_{image_path.split('/')[-1]}"
+    heatmap_img.save(pure_heatmap_name)
     
-    # 创建一个半透明的红色热力图
-    heatmap_color = Image.new("RGB", (orig_w, orig_h), (255, 0, 0))
-    heatmap_mask = heatmap_img.convert("L")  # 用热力图作为透明度遮罩
-    heatmap_color.putalpha(heatmap_mask)     # 加上透明度
+    # 6. 用纯 Pillow 生成“彩虹热力图”叠加效果
+    # 将 0-1 的热力图转换为 0-255 的 RGB 彩虹色 (Jet colormap 的简化版)
+    h = pred_heatmap
+    r = np.clip(1.5 - abs(4.0 * h - 3.0), 0, 1)
+    g = np.clip(1.5 - abs(4.0 * h - 2.0), 0, 1)
+    b = np.clip(1.5 - abs(4.0 * h - 1.0), 0, 1)
     
-    # 将热力图叠加到原图上
+    # 组合成 RGB 图像
+    rgb_array = np.stack((r, g, b), axis=-1)
+    rgb_array = (rgb_array * 255).astype(np.uint8)
+    
+    heatmap_color = Image.fromarray(rgb_array, 'RGB')
+    heatmap_color = heatmap_color.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+    
+    # 将彩虹热力图叠加到原图上
     result_img = image.copy()
-    result_img.paste(heatmap_color, (0, 0), heatmap_color)
+    result_img = Image.blend(result_img, heatmap_color, alpha=0.5)  # 50% 透明度混合
     
-    # 6. 保存并用 Mac 预览打开
+    # 7. 保存并用 Mac 预览打开
     save_name = f"dual_predicted_{image_path.split('/')[-1]}"
     result_img.save(save_name)
-    print(f"✅ 预测完成！结果已保存为 {save_name}")
     
-    # 自动用 Mac 默认看图软件打开
+    print(f"✅ 预测完成！")
+    print(f"📍 1. 红框+彩虹热力图已保存为: {save_name}")
+    print(f"🔥 2. 纯粹黑白热力图已保存为: {pure_heatmap_name} (强烈建议看这张！)")
+    
+    # 自动用 Mac 预览打开两张图
     subprocess.run(["open", save_name])
+    subprocess.run(["open", pure_heatmap_name])
 
 # ================= 4. 命令行参数解析 =================
 if __name__ == "__main__":
