@@ -193,18 +193,28 @@ def train_model():
             
             # 3. 【核心新增】一致性约束 Loss (强迫热力图中心和框的中心对齐！)
             b, c, h, w = pred_heatmap.shape
-            y_indices = torch.arange(h, device=DEVICE, dtype=torch.float32) / h
-            x_indices = torch.arange(w, device=DEVICE, dtype=torch.float32) / w
+            y_indices = torch.arange(h, device=DEVICE, dtype=torch.float32).view(1, 1, h) / h
+            x_indices = torch.arange(w, device=DEVICE, dtype=torch.float32).view(1, 1, w) / w
             
             # 计算热力图的加权平均坐标 (Center of Mass)
-            sum_heatmap = pred_heatmap.sum(dim=[2, 3]) + 1e-6  # 防止除以0
-            center_x = (pred_heatmap.sum(dim=2) * x_indices).sum(dim=2) / sum_heatmap
-            center_y = (pred_heatmap.sum(dim=3) * y_indices).sum(dim=2) / sum_heatmap
+            sum_heatmap = pred_heatmap.sum(dim=[2, 3], keepdim=True) + 1e-6  # 保持维度 [16, 1, 1, 1]
             
-            # 让热力图中心逼近预测框的中心 (squeeze channel dim from center_x/center_y)
+            # 【核心修复】使用 keepdim=True，确保算出来的重心形状是 [16, 1, 1]
+            center_x = (pred_heatmap * x_indices).sum(dim=[2, 3], keepdim=True) / sum_heatmap
+            center_y = (pred_heatmap * y_indices).sum(dim=[2, 3], keepdim=True) / sum_heatmap
+            
+            # 把 [16, 1, 1] 压平为 [16, 1]
+            center_x = center_x.view(b, 1)
+            center_y = center_y.view(b, 1)
+            
+            # 预测框中心 (形状已经是 [16, 1])
+            pred_box_center_x = ((pred_reg[:, 0] + pred_reg[:, 2]) / 2.0).view(b, 1)
+            pred_box_center_y = ((pred_reg[:, 1] + pred_reg[:, 3]) / 2.0).view(b, 1)
+            
+            # 完美对齐的 MSE Loss
             loss_consistency = nn.MSELoss()(
-                torch.stack([center_x.squeeze(1), center_y.squeeze(1)], dim=1),
-                torch.stack([pred_box_center_x, pred_box_center_y], dim=1)
+                torch.cat([center_x, center_y], dim=1),  # 形状 [16, 2]
+                torch.cat([pred_box_center_x, pred_box_center_y], dim=1)  # 形状 [16, 2]
             )
             
             # 4. 总 Loss = 框的损失 + 热力图的损失 + 对齐的损失
