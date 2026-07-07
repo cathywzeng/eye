@@ -2,17 +2,17 @@ import argparse
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
-from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFilter
 import numpy as np
+import os
+import subprocess
 
 # ================= 1. 核心配置 =================
 MODEL_PATH = "dual_head_photography_eye.pth"
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 IMG_SIZE = 224
-HEATMAP_SIZE = 56
 
-# ================= 2. 终极双头模型 (必须与训练时完全一致) =================
+# ================= 2. 终极双头模型 =================
 class DualHeadMobileNet(nn.Module):
     def __init__(self):
         super(DualHeadMobileNet, self).__init__()
@@ -35,16 +35,13 @@ class DualHeadMobileNet(nn.Module):
 
     def forward(self, x):
         features = self.features(x)
-        reg_out = self.reg_head(features)
-        heatmap_out = self.heatmap_head(features)
-        return reg_out, heatmap_out
+        return self.reg_head(features), self.heatmap_head(features)
 
-# ================= 3. 预测并可视化 =================
+# ================= 3. 极速预测并画图 =================
 def predict_and_draw(image_path):
     # 1. 加载模型
     model = DualHeadMobileNet().to(DEVICE)
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
     
     # 2. 加载并预处理图片
@@ -65,13 +62,13 @@ def predict_and_draw(image_path):
     ])
     input_tensor = transform(padded_img).unsqueeze(0).to(DEVICE)
     
-    # 3. 双头预测
+    # 3. 双头预测 (MPS 加速，仅需几毫秒)
     with torch.no_grad():
         pred_reg, pred_heatmap = model(input_tensor)
         pred_reg = torch.sigmoid(pred_reg).cpu().numpy()[0]
         pred_heatmap = pred_heatmap.cpu().numpy()[0, 0]  # 提取 56x56 热力图
         
-    # 4. 还原坐标并画框
+    # 4. 还原坐标并在原图上画红框
     x1 = max(0, (pred_reg[0] * IMG_SIZE - pad_x) / scale)
     y1 = max(0, (pred_reg[1] * IMG_SIZE - pad_y) / scale)
     x2 = min(orig_w, (pred_reg[2] * IMG_SIZE - pad_x) / scale)
@@ -81,25 +78,26 @@ def predict_and_draw(image_path):
     line_width = max(3, int(min(orig_w, orig_h) / 200))
     draw.rectangle([x1, y1, x2, y2], outline="red", width=line_width)
     
-    # 5. 可视化展示 (左边原图+红框，右边热力图)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(image)
-    axes[0].set_title("Predicted Composition Box")
-    axes[0].axis("off")
+    # 5. 将 56x56 热力图放大到原图尺寸，并上色叠加
+    heatmap_img = Image.fromarray((pred_heatmap * 255).astype(np.uint8))
+    heatmap_img = heatmap_img.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
     
-    # 使用 'jet' 或 'hot' 颜色映射显示热力图
-    im = axes[1].imshow(pred_heatmap, cmap='hot')
-    axes[1].set_title("AI Attention Heatmap")
-    axes[1].axis("off")
-    plt.colorbar(im, ax=axes[1])
+    # 创建一个半透明的红色热力图
+    heatmap_color = Image.new("RGB", (orig_w, orig_h), (255, 0, 0))
+    heatmap_mask = heatmap_img.convert("L")  # 用热力图作为透明度遮罩
+    heatmap_color.putalpha(heatmap_mask)     # 加上透明度
     
-    plt.tight_layout()
-    plt.show()
+    # 将热力图叠加到原图上
+    result_img = image.copy()
+    result_img.paste(heatmap_color, (0, 0), heatmap_color)
     
-    # 保存带框的图片
+    # 6. 保存并用 Mac 预览打开
     save_name = f"dual_predicted_{image_path.split('/')[-1]}"
-    image.save(save_name)
+    result_img.save(save_name)
     print(f"✅ 预测完成！结果已保存为 {save_name}")
+    
+    # 自动用 Mac 默认看图软件打开
+    subprocess.run(["open", save_name])
 
 # ================= 4. 命令行参数解析 =================
 if __name__ == "__main__":
